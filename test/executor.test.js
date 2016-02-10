@@ -11,30 +11,50 @@ var should = require('chai').should()
   ;
 
 
-// Test that even if a callback throws an exception, the next DB operations will still be executed
-// We prevent Mocha from catching the exception we throw on purpose by remembering all current handlers, remove them and register them back after test ends
+//Test that even if a callback throws an exception, the next DB operations will still be executed
+//We prevent Mocha from catching the exception we throw on purpose by remembering all current handlers, remove them and register them back after test ends
 function testThrowInCallback (d, done) {
-  var currentUncaughtExceptionHandlers = process.listeners('uncaughtException');
+var currentUncaughtExceptionHandlers = process.listeners('uncaughtException');
 
-  process.removeAllListeners('uncaughtException');
+process.removeAllListeners('uncaughtException');
 
-  process.on('uncaughtException', function (err) {
-    // Do nothing with the error which is only there to test we stay on track
-  });
+process.on('uncaughtException', function (err) {
+ // Do nothing with the error which is only there to test we stay on track
+});
 
-  d.find({}, function (err) {
+d.find({}, function (err) {
+ process.nextTick(function () {
+   d.insert({ bar: 1 }, function (err) {
+     process.removeAllListeners('uncaughtException');
+     for (var i = 0; i < currentUncaughtExceptionHandlers.length; i += 1) {
+       process.on('uncaughtException', currentUncaughtExceptionHandlers[i]);
+     }
+
+     done();
+   });
+ });
+
+ throw new Error('Some error');
+});
+}
+
+//Test that if the callback is falsy, the next DB operations will still be executed
+function testFalsyCallback (d, done) {
+  d.insert({ a: 1 }, null);
+  process.nextTick(function () {
+    d.update({ a: 1 }, { a: 2 }, {}, null);
     process.nextTick(function () {
-      d.insert({ bar: 1 }, function (err) {
-        process.removeAllListeners('uncaughtException');
-        for (var i = 0; i < currentUncaughtExceptionHandlers.length; i += 1) {
-          process.on('uncaughtException', currentUncaughtExceptionHandlers[i]);
-        }
-
-        done();
+      d.update({ a: 2 }, { a: 1 }, null);
+      process.nextTick(function () {
+        d.remove({ a: 2 }, {}, null);
+        process.nextTick(function () {
+          d.remove({ a: 2 }, null);
+          process.nextTick(function () {
+            d.find({}, done);
+          });
+        });
       });
     });
-
-    throw new Error('Some error');
   });
 }
 
@@ -131,6 +151,10 @@ describe('Executor', function () {
       testThrowInCallback(d, done);
     });
     
+    it('A falsy callback doesnt prevent execution of next operations', function(done) {
+      testFalsyCallback(d, done);
+    });
+    
     it('Operations are executed in the right order', function(done) {
       testRightOrder(d, done);
     });
@@ -158,6 +182,10 @@ describe('Executor', function () {
 
     it('A throw in a callback doesnt prevent execution of next operations', function(done) {
       testThrowInCallback(d, done);
+    });
+    
+    it('A falsy callback doesnt prevent execution of next operations', function(done) {
+      testFalsyCallback(d, done);
     });
   
     it('Operations are executed in the right order', function(done) {
