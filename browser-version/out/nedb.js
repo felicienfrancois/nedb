@@ -882,76 +882,83 @@ Cursor.prototype.project = function (candidates) {
  *
  * @param {Function} callback - Signature: err, results
  */
-Cursor.prototype._exec = function(callback) {
-  var candidates = this.db.getCandidates(this.query)
-    , res = [], added = 0, skipped = 0, self = this
+Cursor.prototype._exec = function(_callback) {
+  var res = [], added = 0, skipped = 0, self = this
     , error = null
     , i, keys, key
     ;
 
-  try {
-    for (i = 0; i < candidates.length; i += 1) {
-      if (model.match(candidates[i], this.query)) {
-        // If a sort is defined, wait for the results to be sorted before applying limit and skip
-        if (!this._sort) {
-          if (this._skip && this._skip > skipped) {
-            skipped += 1;
+  function callback (error, res) {
+    if (self.execFn) {
+      return self.execFn(error, res, _callback);
+    } else {
+      return _callback(error, res);
+    }
+  }
+
+  this.db.getCandidates(this.query, function (err, candidates) {
+    if (err) { return callback(err); }
+
+    try {
+      for (i = 0; i < candidates.length; i += 1) {
+        if (model.match(candidates[i], self.query)) {
+          // If a sort is defined, wait for the results to be sorted before applying limit and skip
+          if (!self._sort) {
+            if (self._skip && self._skip > skipped) {
+              skipped += 1;
+            } else {
+              res.push(candidates[i]);
+              added += 1;
+              if (self._limit && self._limit <= added) { break; }
+            }
           } else {
             res.push(candidates[i]);
-            added += 1;
-            if (this._limit && this._limit <= added) { break; }
           }
-        } else {
-          res.push(candidates[i]);
         }
       }
+    } catch (err) {
+      return callback(err);
     }
-  } catch (err) {
-    return callback(err);
-  }
 
-  // Apply all sorts
-  if (this._sort) {
-    keys = Object.keys(this._sort);
+    // Apply all sorts
+    if (self._sort) {
+      keys = Object.keys(self._sort);
 
-    // Sorting
-    var criteria = [];
-    for (i = 0; i < keys.length; i++) {
-      key = keys[i];
-      criteria.push({ key: key, direction: self._sort[key] });
-    }
-    res.sort(function(a, b) {
-      var criterion, compare, i;
-      for (i = 0; i < criteria.length; i++) {
-        criterion = criteria[i];
-        compare = criterion.direction * model.compareThings(model.getDotValue(a, criterion.key), model.getDotValue(b, criterion.key), self.db.compareStrings);
-        if (compare !== 0) {
-          return compare;
-        }
+      // Sorting
+      var criteria = [];
+      for (i = 0; i < keys.length; i++) {
+        key = keys[i];
+        criteria.push({ key: key, direction: self._sort[key] });
       }
-      return 0;
-    });
+      res.sort(function(a, b) {
+        var criterion, compare, i;
+        for (i = 0; i < criteria.length; i++) {
+          criterion = criteria[i];
+          compare = criterion.direction * model.compareThings(model.getDotValue(a, criterion.key), model.getDotValue(b, criterion.key), self.db.compareStrings);
+          if (compare !== 0) {
+            return compare;
+          }
+        }
+        return 0;
+      });
 
-    // Applying limit and skip
-    var limit = this._limit || res.length
-      , skip = this._skip || 0;
+      // Applying limit and skip
+      var limit = self._limit || res.length
+        , skip = self._skip || 0;
 
-    res = res.slice(skip, skip + limit);
-  }
+      res = res.slice(skip, skip + limit);
+    }
 
-  // Apply projection
-  try {
-    res = this.project(res);
-  } catch (e) {
-    error = e;
-    res = undefined;
-  }
+    // Apply projection
+    try {
+      res = self.project(res);
+    } catch (e) {
+      error = e;
+      res = undefined;
+    }
 
-  if (this.execFn) {
-    return this.execFn(error, res, callback);
-  } else {
     return callback(error, res);
-  }
+  });
 };
 
 Cursor.prototype.exec = function () {
@@ -1115,6 +1122,7 @@ function Datastore (options) {
   // binary is always well-balanced
   this.indexes = {};
   this.indexes._id = new Index({ fieldName: '_id', unique: true });
+  this.ttlIndexes = {};
 
   // Queue a load of the database right away and call the onload handler
   // By default (no onload handler), if there is an error there, no operation will be possible so warn the user by throwing an exception
@@ -1161,6 +1169,7 @@ Datastore.prototype.resetIndexes = function (newData) {
  * @param {String} options.fieldName
  * @param {Boolean} options.unique
  * @param {Boolean} options.sparse
+ * @param {Number} options.expireAfterSeconds - Optional, if set this index becomes a TTL index (only works on Date fields, not arrays of Date)
  * @param {Function} cb Optional callback, signature: err
  */
 Datastore.prototype.ensureIndex = function (options, cb) {
@@ -1177,6 +1186,7 @@ Datastore.prototype.ensureIndex = function (options, cb) {
   if (this.indexes[options.fieldName]) { return callback(null); }
 
   this.indexes[options.fieldName] = new Index(options);
+  if (options.expireAfterSeconds !== undefined) { this.ttlIndexes[options.fieldName] = options.expireAfterSeconds; }   // With this implementation index creation is not necessary to ensure TTL but we stick with MongoDB's API here
 
   try {
     this.indexes[options.fieldName].insert(this.getAllData());
@@ -1289,50 +1299,89 @@ Datastore.prototype.updateIndexes = function (oldDoc, newDoc) {
  * One way to make it better would be to enable the use of multiple indexes if the first usable index
  * returns too much data. I may do it in the future.
  *
- * TODO: needs to be moved to the Cursor module
+ * Returned candidates will be scanned to find and remove all expired documents
+ *
+ * @param {Query} query
+ * @param {Boolean} dontExpireStaleDocs Optional, defaults to false, if true don't remove stale docs. Useful for the remove function which shouldn't be impacted by expirations
+ * @param {Function} callback Signature err, docs
  */
-Datastore.prototype.getCandidates = function (query) {
+Datastore.prototype.getCandidates = function (query, dontExpireStaleDocs, callback) {
   var indexNames = Object.keys(this.indexes)
+    , self = this
     , usableQueryKeys;
 
-  // For a basic match
-  usableQueryKeys = [];
-  Object.keys(query).forEach(function (k) {
-    if (typeof query[k] === 'string' || typeof query[k] === 'number' || typeof query[k] === 'boolean' || util.isDate(query[k]) || query[k] === null) {
-      usableQueryKeys.push(k);
-    }
-  });
-  usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
-  if (usableQueryKeys.length > 0) {
-    return this.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]]);
+  if (typeof dontExpireStaleDocs === 'function') {
+    callback = dontExpireStaleDocs;
+    dontExpireStaleDocs = false;
   }
 
-  // For a $in match
-  usableQueryKeys = [];
-  Object.keys(query).forEach(function (k) {
-    if (query[k] && query[k].hasOwnProperty('$in')) {
-      usableQueryKeys.push(k);
+  async.waterfall([
+  // STEP 1: get candidates list by checking indexes from most to least frequent usecase
+  function (cb) {
+    // For a basic match
+    usableQueryKeys = [];
+    Object.keys(query).forEach(function (k) {
+      if (typeof query[k] === 'string' || typeof query[k] === 'number' || typeof query[k] === 'boolean' || util.isDate(query[k]) || query[k] === null) {
+        usableQueryKeys.push(k);
+      }
+    });
+    usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
+    if (usableQueryKeys.length > 0) {
+      return cb(null, self.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]]));
     }
-  });
-  usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
-  if (usableQueryKeys.length > 0) {
-    return this.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]].$in);
-  }
 
-  // For a comparison match
-  usableQueryKeys = [];
-  Object.keys(query).forEach(function (k) {
-    if (query[k] && (query[k].hasOwnProperty('$lt') || query[k].hasOwnProperty('$lte') || query[k].hasOwnProperty('$gt') || query[k].hasOwnProperty('$gte'))) {
-      usableQueryKeys.push(k);
+    // For a $in match
+    usableQueryKeys = [];
+    Object.keys(query).forEach(function (k) {
+      if (query[k] && query[k].hasOwnProperty('$in')) {
+        usableQueryKeys.push(k);
+      }
+    });
+    usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
+    if (usableQueryKeys.length > 0) {
+      return cb(null, self.indexes[usableQueryKeys[0]].getMatching(query[usableQueryKeys[0]].$in));
     }
-  });
-  usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
-  if (usableQueryKeys.length > 0) {
-    return this.indexes[usableQueryKeys[0]].getBetweenBounds(query[usableQueryKeys[0]]);
-  }
 
-  // By default, return all the DB data
-  return this.getAllData();
+    // For a comparison match
+    usableQueryKeys = [];
+    Object.keys(query).forEach(function (k) {
+      if (query[k] && (query[k].hasOwnProperty('$lt') || query[k].hasOwnProperty('$lte') || query[k].hasOwnProperty('$gt') || query[k].hasOwnProperty('$gte'))) {
+        usableQueryKeys.push(k);
+      }
+    });
+    usableQueryKeys = _.intersection(usableQueryKeys, indexNames);
+    if (usableQueryKeys.length > 0) {
+      return cb(null, self.indexes[usableQueryKeys[0]].getBetweenBounds(query[usableQueryKeys[0]]));
+    }
+
+    // By default, return all the DB data
+    return cb(null, self.getAllData());
+  }
+  // STEP 2: remove all expired documents
+  , function (docs) {
+    if (dontExpireStaleDocs) { return callback(null, docs); }
+
+    var expiredDocsIds = [], validDocs = [], ttlIndexesFieldNames = Object.keys(self.ttlIndexes);
+
+    docs.forEach(function (doc) {
+      var valid = true;
+      ttlIndexesFieldNames.forEach(function (i) {
+        if (doc[i] !== undefined && util.isDate(doc[i]) && Date.now() > doc[i].getTime() + self.ttlIndexes[i] * 1000) {
+          valid = false;
+        }
+      });
+      if (valid) { validDocs.push(doc); } else { expiredDocsIds.push(doc._id); }
+    });
+
+    async.eachSeries(expiredDocsIds, function (_id, cb) {
+      self._remove({ _id: _id }, {}, function (err) {
+        if (err) { return callback(err); }
+        return cb();
+      });
+    }, function (err) {
+      return callback(null, validDocs);
+    });
+  }]);
 };
 
 
@@ -1594,48 +1643,49 @@ Datastore.prototype._update = function (query, updateQuery, options, cb) {
     });
   }
   , function () {   // Perform the update
-    var modifiedDoc
-      , candidates = self.getCandidates(query)
-      , modifications = []
-      ;
+    var modifiedDoc , modifications = [];
 
-    // Preparing update (if an error is thrown here neither the datafile nor
-    // the in-memory indexes are affected)
-    try {
-      for (i = 0; i < candidates.length; i += 1) {
-        if (model.match(candidates[i], query) && (multi || numReplaced === 0)) {
-          numReplaced += 1;
-          modifiedDoc = model.modify(candidates[i], updateQuery);
-          if (self.timestampData) { modifiedDoc.updatedAt = new Date(); }
-          modifications.push({ oldDoc: candidates[i], newDoc: modifiedDoc });
-        }
-      }
-    } catch (err) {
-      return callback(err);
-    }
-
-    // Change the docs in memory
-    try {
-        self.updateIndexes(modifications);
-    } catch (err) {
-      return callback(err);
-    }
-
-    // Update the datafile
-    var updatedDocs = _.pluck(modifications, 'newDoc');
-    self.persistence.persistNewState(updatedDocs, function (err) {
+    self.getCandidates(query, function (err, candidates) {
       if (err) { return callback(err); }
-      if (!options.returnUpdatedDocs) {
-        return callback(null, numReplaced);
-      } else {
-        var updatedDocsDC = [];
-        updatedDocs.forEach(function (doc) { updatedDocsDC.push(model.deepCopy(doc)); });
-        return callback(null, numReplaced, updatedDocsDC);
+
+      // Preparing update (if an error is thrown here neither the datafile nor
+      // the in-memory indexes are affected)
+      try {
+        for (i = 0; i < candidates.length; i += 1) {
+          if (model.match(candidates[i], query) && (multi || numReplaced === 0)) {
+            numReplaced += 1;
+            modifiedDoc = model.modify(candidates[i], updateQuery);
+            if (self.timestampData) { modifiedDoc.updatedAt = new Date(); }
+            modifications.push({ oldDoc: candidates[i], newDoc: modifiedDoc });
+          }
+        }
+      } catch (err) {
+        return callback(err);
       }
+
+      // Change the docs in memory
+      try {
+        self.updateIndexes(modifications);
+      } catch (err) {
+        return callback(err);
+      }
+
+      // Update the datafile
+      var updatedDocs = _.pluck(modifications, 'newDoc');
+      self.persistence.persistNewState(updatedDocs, function (err) {
+        if (err) { return callback(err); }
+        if (!options.returnUpdatedDocs) {
+          return callback(null, numReplaced);
+        } else {
+          var updatedDocsDC = [];
+          updatedDocs.forEach(function (doc) { updatedDocsDC.push(model.deepCopy(doc)); });
+          return callback(null, numReplaced, updatedDocsDC);
+        }
+      });
     });
-  }
-  ]);
+  }]);
 };
+
 Datastore.prototype.update = function () {
   this.executor.push({ this: this, fn: this._update, arguments: arguments });
 };
@@ -1653,38 +1703,36 @@ Datastore.prototype.update = function () {
  */
 Datastore.prototype._remove = function (query, options, cb) {
   var callback
-    , self = this
-    , numRemoved = 0
-    , multi
-    , removedDocs = []
-    , candidates = this.getCandidates(query)
+    , self = this, numRemoved = 0, removedDocs = [], multi
     ;
 
   if (typeof options === 'function') { cb = options; options = {}; }
   callback = cb || function () {};
   multi = options.multi !== undefined ? options.multi : false;
 
-  try {
-    candidates.forEach(function (d) {
-      if (model.match(d, query) && (multi || numRemoved === 0)) {
-        numRemoved += 1;
-        removedDocs.push({ $$deleted: true, _id: d._id });
-        self.removeFromIndexes(d);
-      }
-    });
-  } catch (err) { return callback(err); }
-
-  self.persistence.persistNewState(removedDocs, function (err) {
+  this.getCandidates(query, true, function (err, candidates) {
     if (err) { return callback(err); }
-    return callback(null, numRemoved);
+
+    try {
+      candidates.forEach(function (d) {
+        if (model.match(d, query) && (multi || numRemoved === 0)) {
+          numRemoved += 1;
+          removedDocs.push({ $$deleted: true, _id: d._id });
+          self.removeFromIndexes(d);
+        }
+      });
+    } catch (err) { return callback(err); }
+
+    self.persistence.persistNewState(removedDocs, function (err) {
+      if (err) { return callback(err); }
+      return callback(null, numRemoved);
+    });
   });
 };
+
 Datastore.prototype.remove = function () {
   this.executor.push({ this: this, fn: this._remove, arguments: arguments });
 };
-
-
-
 
 
 
@@ -1724,6 +1772,9 @@ function Executor () {
       };
 
       newArguments[newArguments.length - 1] = callback;
+    } else if (!lastArg && task.arguments.length) {
+        callback = function () { cb(); };
+        newArguments[newArguments.length - 1] = callback;
     } else {
       callback = function () { cb(); };
       newArguments.push(callback);
@@ -1860,12 +1911,12 @@ Index.prototype.insert = function (doc) {
         break;
       }
     }
-    
+
     if (error) {
       for (i = 0; i < failingI; i += 1) {
         this.tree.delete(keys[i], doc);
       }
-      
+
       throw error;
     }
   }
@@ -2332,6 +2383,9 @@ lastStepModifierFunctions.$unset = function (obj, field, value) {
 
 /**
  * Push an element to the end of an array field
+ * Optional modifier $each instead of value to push several values
+ * Optional modifier $slice to slice the resulting array, see https://docs.mongodb.org/manual/reference/operator/update/slice/
+ * Différeence with MongoDB: if $slice is specified and not $each, we act as if value is an empty array
  */
 lastStepModifierFunctions.$push = function (obj, field, value) {
   // Create the array if it doesn't exist
@@ -2339,13 +2393,33 @@ lastStepModifierFunctions.$push = function (obj, field, value) {
 
   if (!util.isArray(obj[field])) { throw new Error("Can't $push an element on non-array values"); }
 
+  if (value !== null && typeof value === 'object' && value.$slice && value.$each === undefined) {
+    value.$each = [];
+  }
+
   if (value !== null && typeof value === 'object' && value.$each) {
-    if (Object.keys(value).length > 1) { throw new Error("Can't use another field in conjunction with $each"); }
+    if (Object.keys(value).length >= 3 || (Object.keys(value).length === 2 && value.$slice === undefined)) { throw new Error("Can only use $slice in cunjunction with $each when $push to array"); }
     if (!util.isArray(value.$each)) { throw new Error("$each requires an array value"); }
 
     value.$each.forEach(function (v) {
       obj[field].push(v);
     });
+
+    if (value.$slice === undefined || typeof value.$slice !== 'number') { return; }
+
+    if (value.$slice === 0) {
+      obj[field] = [];
+    } else {
+      var start, end, n = obj[field].length;
+      if (value.$slice < 0) {
+        start = Math.max(0, n + value.$slice);
+        end = n;
+      } else if (value.$slice > 0) {
+        start = 0;
+        end = Math.min(n, value.$slice);
+      }
+      obj[field] = obj[field].slice(start, end);
+    }
   } else {
     obj[field].push(value);
   }
@@ -2428,6 +2502,28 @@ lastStepModifierFunctions.$inc = function (obj, field, value) {
     }
   } else {
     obj[field] += value;
+  }
+};
+
+/**
+ * Updates the value of the field, only if specified field is greater than the current value of the field
+ */
+lastStepModifierFunctions.$max = function (obj, field, value) {
+  if (typeof obj[field] === 'undefined') {
+    obj[field] = value;
+  } else if (value > obj[field]) {
+    obj[field] = value;
+  }
+};
+
+/**
+ * Updates the value of the field, only if specified field is smaller than the current value of the field
+ */
+lastStepModifierFunctions.$min = function (obj, field, value) {
+  if (typeof obj[field] === 'undefined') { 
+    obj[field] = value;
+  } else if (value < obj[field]) {
+    obj[field] = value;
   }
 };
 
@@ -2667,7 +2763,20 @@ comparisonFunctions.$size = function (obj, value) {
 
     return (obj.length == value);
 };
+comparisonFunctions.$elemMatch = function (obj, value) {
+  if (!util.isArray(obj)) { return false; }
+  var i = obj.length;
+  var result = false;   // Initialize result
+  while (i--) {
+    if (match(obj[i], value)) {   // If match for array element, return true
+      result = true;
+      break;
+    }
+  }
+  return result;
+};
 arrayComparisonFunctions.$size = true;
+arrayComparisonFunctions.$elemMatch = true;
 
 
 /**
@@ -5266,7 +5375,7 @@ module.exports.defaultCheckValueEquality = defaultCheckValueEquality;
 },{}],18:[function(require,module,exports){
 var process=require("__browserify_process"),global=self;/*!
     localForage -- Offline Storage, Improved
-    Version 1.3.0
+    Version 1.3.3
     https://mozilla.github.io/localForage
     (c) 2013-2015 Mozilla, Apache License 2.0
 */
@@ -6015,7 +6124,7 @@ return /******/ (function(modules) { // webpackBootstrap
 
 	function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError('Cannot call a class as a function'); } }
 
-	(function () {
+	var localForage = (function (globalObject) {
 	    'use strict';
 
 	    // Custom drivers are stored here when `defineDriver()` is called.
@@ -6043,39 +6152,46 @@ return /******/ (function(modules) { // webpackBootstrap
 	        version: 1.0
 	    };
 
-	    // Check to see if IndexedDB is available and if it is the latest
-	    // implementation; it's our preferred backend library. We use "_spec_test"
-	    // as the name of the database because it's not the one we'll operate on,
-	    // but it's useful to make sure its using the right spec.
-	    // See: https://github.com/mozilla/localForage/issues/128
 	    var driverSupport = (function (self) {
-	        // Initialize IndexedDB; fall back to vendor-prefixed versions
-	        // if needed.
-	        var indexedDB = indexedDB || self.indexedDB || self.webkitIndexedDB || self.mozIndexedDB || self.OIndexedDB || self.msIndexedDB;
-
 	        var result = {};
 
-	        result[DriverType.WEBSQL] = !!self.openDatabase;
+	        // Check to see if IndexedDB is available and if it is the latest
+	        // implementation; it's our preferred backend library. We use "_spec_test"
+	        // as the name of the database because it's not the one we'll operate on,
+	        // but it's useful to make sure its using the right spec.
+	        // See: https://github.com/mozilla/localForage/issues/128
 	        result[DriverType.INDEXEDDB] = !!(function () {
-	            // We mimic PouchDB here; just UA test for Safari (which, as of
-	            // iOS 8/Yosemite, doesn't properly support IndexedDB).
-	            // IndexedDB support is broken and different from Blink's.
-	            // This is faster than the test case (and it's sync), so we just
-	            // do this. *SIGH*
-	            // http://bl.ocks.org/nolanlawson/raw/c83e9039edf2278047e9/
-	            //
-	            // We test for openDatabase because IE Mobile identifies itself
-	            // as Safari. Oh the lulz...
-	            if (typeof self.openDatabase !== 'undefined' && self.navigator && self.navigator.userAgent && /Safari/.test(self.navigator.userAgent) && !/Chrome/.test(self.navigator.userAgent)) {
-	                return false;
-	            }
 	            try {
+	                // Initialize IndexedDB; fall back to vendor-prefixed versions
+	                // if needed.
+	                var indexedDB = indexedDB || self.indexedDB || self.webkitIndexedDB || self.mozIndexedDB || self.OIndexedDB || self.msIndexedDB;
+	                // We mimic PouchDB here; just UA test for Safari (which, as of
+	                // iOS 8/Yosemite, doesn't properly support IndexedDB).
+	                // IndexedDB support is broken and different from Blink's.
+	                // This is faster than the test case (and it's sync), so we just
+	                // do this. *SIGH*
+	                // http://bl.ocks.org/nolanlawson/raw/c83e9039edf2278047e9/
+	                //
+	                // We test for openDatabase because IE Mobile identifies itself
+	                // as Safari. Oh the lulz...
+	                if (typeof self.openDatabase !== 'undefined' && self.navigator && self.navigator.userAgent && /Safari/.test(self.navigator.userAgent) && !/Chrome/.test(self.navigator.userAgent)) {
+	                    return false;
+	                }
+
 	                return indexedDB && typeof indexedDB.open === 'function' &&
 	                // Some Samsung/HTC Android 4.0-4.3 devices
 	                // have older IndexedDB specs; if this isn't available
 	                // their IndexedDB is too old for us to use.
 	                // (Replaces the onupgradeneeded test.)
 	                typeof self.IDBKeyRange !== 'undefined';
+	            } catch (e) {
+	                return false;
+	            }
+	        })();
+
+	        result[DriverType.WEBSQL] = !!(function () {
+	            try {
+	                return self.openDatabase;
 	            } catch (e) {
 	                return false;
 	            }
@@ -6090,7 +6206,7 @@ return /******/ (function(modules) { // webpackBootstrap
 	        })();
 
 	        return result;
-	    })(this);
+	    })(globalObject);
 
 	    var isArray = Array.isArray || function (arg) {
 	        return Object.prototype.toString.call(arg) === '[object Array]';
@@ -6417,10 +6533,9 @@ return /******/ (function(modules) { // webpackBootstrap
 	        return LocalForage;
 	    })();
 
-	    var localForage = new LocalForage();
-
-	    exports['default'] = localForage;
-	}).call(typeof window !== 'undefined' ? window : self);
+	    return new LocalForage();
+	})(typeof window !== 'undefined' ? window : self);
+	exports['default'] = localForage;
 	module.exports = exports['default'];
 
 /***/ },
@@ -6432,12 +6547,11 @@ return /******/ (function(modules) { // webpackBootstrap
 	'use strict';
 
 	exports.__esModule = true;
-	(function () {
+	var asyncStorage = (function (globalObject) {
 	    'use strict';
 
-	    var globalObject = this;
 	    // Initialize IndexedDB; fall back to vendor-prefixed versions if needed.
-	    var indexedDB = indexedDB || this.indexedDB || this.webkitIndexedDB || this.mozIndexedDB || this.OIndexedDB || this.msIndexedDB;
+	    var indexedDB = indexedDB || globalObject.indexedDB || globalObject.webkitIndexedDB || globalObject.mozIndexedDB || globalObject.OIndexedDB || globalObject.msIndexedDB;
 
 	    // If IndexedDB isn't available, we get outta here!
 	    if (!indexedDB) {
@@ -6550,6 +6664,7 @@ return /******/ (function(modules) { // webpackBootstrap
 	                    });
 	                };
 	            };
+	            txn.onerror = txn.onabort = reject;
 	        })['catch'](function () {
 	            return false; // error, so assume unsupported
 	        });
@@ -6593,6 +6708,61 @@ return /******/ (function(modules) { // webpackBootstrap
 	        return value && value.__local_forage_encoded_blob;
 	    }
 
+	    // Specialize the default `ready()` function by making it dependent
+	    // on the current database operations. Thus, the driver will be actually
+	    // ready when it's been initialized (default) *and* there are no pending
+	    // operations on the database (initiated by some other instances).
+	    function _fullyReady(callback) {
+	        var self = this;
+
+	        var promise = self._initReady().then(function () {
+	            var dbContext = dbContexts[self._dbInfo.name];
+
+	            if (dbContext && dbContext.dbReady) {
+	                return dbContext.dbReady;
+	            }
+	        });
+
+	        promise.then(callback, callback);
+	        return promise;
+	    }
+
+	    function _deferReadiness(dbInfo) {
+	        var dbContext = dbContexts[dbInfo.name];
+
+	        // Create a deferred object representing the current database operation.
+	        var deferredOperation = {};
+
+	        deferredOperation.promise = new Promise(function (resolve) {
+	            deferredOperation.resolve = resolve;
+	        });
+
+	        // Enqueue the deferred operation.
+	        dbContext.deferredOperations.push(deferredOperation);
+
+	        // Chain its promise to the database readiness.
+	        if (!dbContext.dbReady) {
+	            dbContext.dbReady = deferredOperation.promise;
+	        } else {
+	            dbContext.dbReady = dbContext.dbReady.then(function () {
+	                return deferredOperation.promise;
+	            });
+	        }
+	    }
+
+	    function _advanceReadiness(dbInfo) {
+	        var dbContext = dbContexts[dbInfo.name];
+
+	        // Dequeue a deferred operation.
+	        var deferredOperation = dbContext.deferredOperations.pop();
+
+	        // Resolve its promise (which is part of the database readiness
+	        // chain of promises).
+	        if (deferredOperation) {
+	            deferredOperation.resolve();
+	        }
+	    }
+
 	    // Open the IndexedDB database (automatically creates one if one didn't
 	    // previously exist), using any options set in the config.
 	    function _initStorage(options) {
@@ -6621,17 +6791,27 @@ return /******/ (function(modules) { // webpackBootstrap
 	                // Running localForages sharing a database.
 	                forages: [],
 	                // Shared database.
-	                db: null
+	                db: null,
+	                // Database readiness (promise).
+	                dbReady: null,
+	                // Deferred operations on the database.
+	                deferredOperations: []
 	            };
 	            // Register the new context in the global container.
 	            dbContexts[dbInfo.name] = dbContext;
 	        }
 
 	        // Register itself as a running localForage in the current context.
-	        dbContext.forages.push(this);
+	        dbContext.forages.push(self);
 
-	        // Create an array of readiness of the related localForages.
-	        var readyPromises = [];
+	        // Replace the default `ready()` function with the specialized one.
+	        if (!self._initReady) {
+	            self._initReady = self.ready;
+	            self.ready = _fullyReady;
+	        }
+
+	        // Create an array of initialization states of the related localForages.
+	        var initPromises = [];
 
 	        function ignoreErrors() {
 	            // Don't handle errors here,
@@ -6641,9 +6821,9 @@ return /******/ (function(modules) { // webpackBootstrap
 
 	        for (var j = 0; j < dbContext.forages.length; j++) {
 	            var forage = dbContext.forages[j];
-	            if (forage !== this) {
+	            if (forage !== self) {
 	                // Don't wait for itself...
-	                readyPromises.push(forage.ready()['catch'](ignoreErrors));
+	                initPromises.push(forage._initReady()['catch'](ignoreErrors));
 	            }
 	        }
 
@@ -6652,7 +6832,7 @@ return /******/ (function(modules) { // webpackBootstrap
 
 	        // Initialize the connection process only when
 	        // all the related localForages aren't pending.
-	        return Promise.all(readyPromises).then(function () {
+	        return Promise.all(initPromises).then(function () {
 	            dbInfo.db = dbContext.db;
 	            // Get the connection or open a new one without upgrade.
 	            return _getOriginalConnection(dbInfo);
@@ -6667,7 +6847,7 @@ return /******/ (function(modules) { // webpackBootstrap
 	            dbInfo.db = dbContext.db = db;
 	            self._dbInfo = dbInfo;
 	            // Share the final connection amongst related localForages.
-	            for (var k in forages) {
+	            for (var k = 0; k < forages.length; k++) {
 	                var forage = forages[k];
 	                if (forage !== self) {
 	                    // Self is already up-to-date.
@@ -6688,8 +6868,10 @@ return /******/ (function(modules) { // webpackBootstrap
 
 	    function _getConnection(dbInfo, upgradeNeeded) {
 	        return new Promise(function (resolve, reject) {
+
 	            if (dbInfo.db) {
 	                if (upgradeNeeded) {
+	                    _deferReadiness(dbInfo);
 	                    dbInfo.db.close();
 	                } else {
 	                    return resolve(dbInfo.db);
@@ -6729,6 +6911,7 @@ return /******/ (function(modules) { // webpackBootstrap
 
 	            openreq.onsuccess = function () {
 	                resolve(openreq.result);
+	                _advanceReadiness(dbInfo);
 	            };
 	        });
 	    }
@@ -6861,10 +7044,13 @@ return /******/ (function(modules) { // webpackBootstrap
 	            var dbInfo;
 	            self.ready().then(function () {
 	                dbInfo = self._dbInfo;
-	                return _checkBlobSupport(dbInfo.db);
-	            }).then(function (blobSupport) {
-	                if (!blobSupport && value instanceof Blob) {
-	                    return _encodeBlob(value);
+	                if (value instanceof Blob) {
+	                    return _checkBlobSupport(dbInfo.db).then(function (blobSupport) {
+	                        if (blobSupport) {
+	                            return value;
+	                        }
+	                        return _encodeBlob(value);
+	                    });
 	                }
 	                return value;
 	            }).then(function (value) {
@@ -6879,7 +7065,6 @@ return /******/ (function(modules) { // webpackBootstrap
 	                    value = undefined;
 	                }
 
-	                var req = store.put(value, key);
 	                transaction.oncomplete = function () {
 	                    // Cast to undefined so the value passed to
 	                    // callback/promise is the same as what one would get out
@@ -6897,6 +7082,8 @@ return /******/ (function(modules) { // webpackBootstrap
 	                    var err = req.error ? req.error : req.transaction.error;
 	                    reject(err);
 	                };
+
+	                var req = store.put(value, key);
 	            })['catch'](reject);
 	        });
 
@@ -7102,8 +7289,9 @@ return /******/ (function(modules) { // webpackBootstrap
 	        keys: keys
 	    };
 
-	    exports['default'] = asyncStorage;
-	}).call(typeof window !== 'undefined' ? window : self);
+	    return asyncStorage;
+	})(typeof window !== 'undefined' ? window : self);
+	exports['default'] = asyncStorage;
 	module.exports = exports['default'];
 
 /***/ },
@@ -7117,10 +7305,9 @@ return /******/ (function(modules) { // webpackBootstrap
 	'use strict';
 
 	exports.__esModule = true;
-	(function () {
+	var localStorageWrapper = (function (globalObject) {
 	    'use strict';
 
-	    var globalObject = this;
 	    var localStorage = null;
 
 	    // If the app is running inside a Google Chrome packaged webapp, or some
@@ -7131,12 +7318,12 @@ return /******/ (function(modules) { // webpackBootstrap
 	    try {
 	        // If localStorage isn't available, we get outta here!
 	        // This should be inside a try catch
-	        if (!this.localStorage || !('setItem' in this.localStorage)) {
+	        if (!globalObject.localStorage || !('setItem' in globalObject.localStorage)) {
 	            return;
 	        }
 	        // Initialize localStorage and create a variable to use throughout
 	        // the code.
-	        localStorage = this.localStorage;
+	        localStorage = globalObject.localStorage;
 	    } catch (e) {
 	        return;
 	    }
@@ -7410,8 +7597,9 @@ return /******/ (function(modules) { // webpackBootstrap
 	        keys: keys
 	    };
 
-	    exports['default'] = localStorageWrapper;
-	}).call(typeof window !== 'undefined' ? window : self);
+	    return localStorageWrapper;
+	})(typeof window !== 'undefined' ? window : self);
+	exports['default'] = localStorageWrapper;
 	module.exports = exports['default'];
 
 /***/ },
@@ -7421,7 +7609,7 @@ return /******/ (function(modules) { // webpackBootstrap
 	'use strict';
 
 	exports.__esModule = true;
-	(function () {
+	var localforageSerializer = (function (globalObject) {
 	    'use strict';
 
 	    // Sadly, the best way to save binary data in WebSQL/localStorage is serializing
@@ -7448,9 +7636,6 @@ return /******/ (function(modules) { // webpackBootstrap
 	    var TYPE_FLOAT32ARRAY = 'fl32';
 	    var TYPE_FLOAT64ARRAY = 'fl64';
 	    var TYPE_SERIALIZED_MARKER_LENGTH = SERIALIZED_MARKER_LENGTH + TYPE_ARRAYBUFFER.length;
-
-	    // Get out of our habit of using `window` inline, at least.
-	    var globalObject = this;
 
 	    // Abstracts constructing a Blob object, so it also works in older
 	    // browsers that don't support the native Blob constructor. (i.e.
@@ -7675,8 +7860,9 @@ return /******/ (function(modules) { // webpackBootstrap
 	        bufferToString: bufferToString
 	    };
 
-	    exports['default'] = localforageSerializer;
-	}).call(typeof window !== 'undefined' ? window : self);
+	    return localforageSerializer;
+	})(typeof window !== 'undefined' ? window : self);
+	exports['default'] = localforageSerializer;
 	module.exports = exports['default'];
 
 /***/ },
@@ -7695,11 +7881,10 @@ return /******/ (function(modules) { // webpackBootstrap
 	'use strict';
 
 	exports.__esModule = true;
-	(function () {
+	var webSQLStorage = (function (globalObject) {
 	    'use strict';
 
-	    var globalObject = this;
-	    var openDatabase = this.openDatabase;
+	    var openDatabase = globalObject.openDatabase;
 
 	    // If WebSQL methods aren't available, we can stop now.
 	    if (!openDatabase) {
@@ -8037,8 +8222,9 @@ return /******/ (function(modules) { // webpackBootstrap
 	        keys: keys
 	    };
 
-	    exports['default'] = webSQLStorage;
-	}).call(typeof window !== 'undefined' ? window : self);
+	    return webSQLStorage;
+	})(typeof window !== 'undefined' ? window : self);
+	exports['default'] = webSQLStorage;
 	module.exports = exports['default'];
 
 /***/ }
